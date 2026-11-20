@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Informes de red</title>
+<!-- MAKE THE CUT — netlogs.html (owner: net). Visor de los informes de red de los partidos online (js/netlog.js), 17-nov-2026.
+     Usa la sesión de la cuenta guardada en ESTE navegador (la del juego, mismo origen) y solo funciona con la cuenta de Ferran:
+     las reglas de netlogs/{id} solo dejan leer a esa cuenta (firebase/firestore.rules). No escribe nada.
+     Online V2: columna Modelo (Precisa / Fluida; los informes viejos no lo traen y son Precisa) y, en Fluida, la columna Fluida con
+     un resumen de flStats (sin rollback ni ventaja: rb/adv van a null y salen como «–»). -->
+<style>
+:root{--bg:#14102a;--card:#211b40;--ink:#f3eefc;--mut:#a59cc4;--line:#3a3166;--ok:#4fd1a5;--warn:#ffb238;--bad:#ff6a5c;--acc:#ff6a2e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{margin:0 0 16px;color:var(--mut)}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--acc)}
+#msg{color:var(--mut)}
+.sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
+.sum div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px}
+.sum b{display:block;font-size:20px}
+.sum span{color:var(--mut);font-size:12px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{color:var(--mut);font-weight:600;font-size:12px;position:sticky;top:0;background:var(--bg)}
+tr.m{cursor:pointer}
+tr.m:hover td{background:#1b1636}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.det td{background:#181333;white-space:normal}
+.det table th{background:#181333}
+.ev{color:var(--mut);font-size:12px;margin-top:8px;line-height:1.7}
+.ev code{background:#2a2350;border-radius:4px;padding:1px 5px;margin-right:4px;color:var(--ink)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Informes de red</h1>
+  <p class="sub">Partidos online, un informe por jugador y partido. Ping de la app: el que se procesa en el juego (suma los tirones de las dos máquinas). Ping de red: el de WebRTC.</p>
+  <div class="bar"><button id="load">Cargar</button><button id="copy" disabled>Copiar todo (JSON)</button><span id="msg"></span></div>
+  <div class="sum" id="sum"></div>
+  <div class="wrap"><table id="tb"><thead><tr><th>Cuándo</th><th>Jugador</th><th>Rival</th><th>Rol</th><th>Modelo</th><th>Dur.</th><th>Ruta</th><th>Ping app (media / p95 / máx)</th><th>Ping red</th><th>Esperas</th><th>Rollback máx</th><th>FPS mín</th><th>Frames lentos</th><th>Fluida</th><th>Sucesos</th><th>Fin</th></tr></thead><tbody></tbody></table></div>
+</main>
+<script>
+(function () {
+  'use strict';
+  var KEY = 'AIzaSyC59o9QtpUvjWT4g3ouOXinghASTuXZSes';
+  var FS = 'https://firestore.googleapis.com/v1/projects/make-the-cut-vb/databases/(default)/documents';
+  var rows = [], $ = function (id) { return document.getElementById(id); };
+  function msg(t) { $('msg').textContent = t; }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function token() {
+    var acc = null; try { acc = JSON.parse(localStorage.getItem('make-the-cut.account') || 'null'); } catch (e) { }
+    if (!acc || !acc.rt) return Promise.reject(new Error('No hay ninguna cuenta abierta en este navegador. Entra en el juego con tu cuenta y vuelve.'));
+    if (acc.it && acc.ie > Date.now() + 60e3) return Promise.resolve(acc.it);
+    return fetch('https://securetoken.googleapis.com/v1/token?key=' + KEY, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(acc.rt) })
+      .then(function (r) { return r.json(); }).then(function (j) { if (!j.id_token) throw new Error('La sesión ha caducado: entra otra vez en el juego.'); return j.id_token; });
+  }
+  function cls(v, a, b) { return v == null ? '' : v >= b ? 'bad' : v >= a ? 'warn' : 'ok'; }
+  function agg(r) {   // resumen de un informe a partir de sus ventanas
+    var w = r.wins || [], app = [], ice = [], o = { waits: 0, waitMs: 0, rb: null, fps: null, slow: 0 };
+    w.forEach(function (x) {
+      if (x.rtt) app.push(x.rtt); if (x.ice) ice.push(x.ice);
+      o.waits += x.waits || 0; o.waitMs += x.waitMs || 0; o.slow += x.slow || 0;
+      if (x.rb && (o.rb == null || x.rb[1] > o.rb)) o.rb = x.rb[1];
+      if (x.fps && (o.fps == null || x.fps < o.fps)) o.fps = x.fps;
+    });
+    function m(L, i, f) { if (!L.length) return null; return f === 'max' ? Math.max.apply(null, L.map(function (x) { return x[i]; })) : Math.round(L.reduce(function (s, x) { return s + x[i]; }, 0) / L.length); }
+    o.appAvg = m(app, 1); o.appP95 = m(app, 2); o.appMax = m(app, 3, 'max'); o.iceAvg = m(ice, 1); o.iceMax = m(ice, 3, 'max');
+    return o;
+  }
+  function modelo(r) { return r.modelo === 'fluida' ? 'Fluida' : 'Precisa'; }
+  function flTxt(f) {   // resumen compacto de flStats (Fluida)
+    if (!f) return '–';
+    var L = [];
+    if (f.forks != null) L.push('bifurc. ' + f.forks);
+    if (f.late != null) L.push('tarde ' + f.late + (f.lateMaxMs != null ? ' (máx ' + Math.round(f.lateMaxMs) + ' ms)' : ''));
+    if (f.interpMs != null) L.push('interp. ' + Math.round(f.interpMs) + ' ms');
+    if (f.extrapTicks != null) L.push('extrap. ' + f.extrapTicks);
+    if (f.warpMax != null) L.push('warp ' + f.warpMax);
+    if (f.ptBad || f.digestBad) L.push('marcador ' + (f.ptBad || 0) + '/' + (f.digestBad || 0));
+    return L.length ? L.join(' · ') : '–';
+  }
+  function flDet(f) {   // todos los campos (detalle)
+    if (!f) return '–';
+    return Object.keys(f).map(function (k) { return k + ' ' + f[k]; }).join(' · ');
+  }
+  function render() {
+    var tb = $('tb').tBodies[0]; tb.innerHTML = '';
+    var all = rows.map(function (r) { return agg(r.rep); });
+    var n = rows.length, f = function (k) { var L = all.map(function (a) { return a[k]; }).filter(function (v) { return v != null; }); return L.length ? Math.round(L.reduce(function (s, v) { return s + v; }, 0) / L.length) : '–'; };
+    $('sum').innerHTML = '<div><b>' + n + '</b><span>informes</span></div><div><b>' + f('appAvg') + ' ms</b><span>ping app medio</span></div><div><b>' + f('iceAvg') + ' ms</b><span>ping red medio</span></div>'
+      + '<div><b>' + f('waitMs') + ' ms</b><span>esperas por partido</span></div><div><b>' + f('rb') + '</b><span>rollback máx medio (tics)</span></div><div><b>' + f('fps') + '</b><span>FPS mín medio</span></div>';
+    rows.forEach(function (row, i) {
+      var r = row.rep, a = all[i], tr = document.createElement('tr'); tr.className = 'm';
+      var when = r.ini ? new Date(r.ini).toLocaleString('es-ES', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+      var evn = (r.ev || []).filter(function (e) { return /espera|inestable|resync|huella|marcador|contra_ia|abandono/.test(e.k); }).length;
+      var fin = r.res ? (r.res.gana ? 'gana' : 'pierde') + (r.res.noValido ? ' (no válido)' : '') : ((r.ev || []).filter(function (e) { return e.k === 'fin'; })[0] || {}).why || r.estado || '';
+      tr.innerHTML = '<td>' + esc(when) + '</td><td>' + esc(r.yo) + '<br><span class="ev">' + esc((r.env && (r.env.br + ' · ' + r.env.os + (r.env.mob ? ' · móvil' : ''))) || '') + '</span></td><td>' + esc(r.rival) + '</td><td>' + esc(r.rol) + '</td><td>' + esc(modelo(r)) + '</td><td>' + esc(Math.round(r.dur || 0)) + ' s</td>'
+        + '<td>' + esc(r.conn || '–') + '</td><td class="' + cls(a.appP95, 120, 200) + '">' + (a.appAvg != null ? a.appAvg + ' / ' + a.appP95 + ' / ' + a.appMax : '–') + '</td><td class="' + cls(a.iceAvg, 100, 180) + '">' + (a.iceAvg != null ? a.iceAvg + ' (máx ' + a.iceMax + ')' : '–') + '</td>'
+        + '<td class="' + cls(a.waitMs, 300, 1500) + '">' + a.waits + ' (' + Math.round(a.waitMs) + ' ms)</td><td class="' + cls(a.rb, 8, 15) + '">' + (a.rb != null ? a.rb : '–') + '</td><td class="' + (a.fps != null && a.fps < 45 ? 'bad' : a.fps != null && a.fps < 55 ? 'warn' : 'ok') + '">' + (a.fps != null ? a.fps : '–') + '</td><td>' + a.slow + '</td><td class="ev">' + esc(r.modelo === 'fluida' ? flTxt(r.fl) : '–') + '</td><td>' + evn + '</td><td>' + esc(fin) + '</td>';
+      var det = document.createElement('tr'); det.className = 'det'; det.hidden = true;
+      var wt = '<table><thead><tr><th>t (s)</th><th>Ping app</th><th>Ping red</th><th>FPS</th><th>Peor frame</th><th>Lentos</th><th>Esperas</th><th>Rollback (media/máx)</th><th>Ventaja</th><th>Enviados/recibidos</th><th>KB</th><th>Inestable</th><th>Oculta</th>' + (r.modelo === 'fluida' ? '<th>Fluida (acumulado)</th>' : '') + '</tr></thead><tbody>'
+        + (r.wins || []).map(function (x) {
+          return '<tr><td>' + x.t + '</td><td class="' + cls(x.rtt && x.rtt[2], 120, 200) + '">' + (x.rtt ? x.rtt.join(' / ') : '–') + '</td><td>' + (x.ice ? x.ice[1] + ' (máx ' + x.ice[3] + ')' : '–') + '</td><td>' + x.fps + '</td><td>' + x.worst + ' ms</td><td>' + x.slow + '</td>'
+            + '<td class="' + cls(x.waitMs, 150, 800) + '">' + x.waits + ' (' + x.waitMs + ' ms)</td><td>' + (x.rb ? x.rb.join(' / ') : '–') + '</td><td>' + (x.adv ? x.adv.join(' … ') : '–') + '</td><td>' + x.sent + ' / ' + x.recv + '</td><td>' + x.kbOut + '</td><td>' + x.unstMs + ' ms</td><td>' + x.hidMs + ' ms</td>' + (r.modelo === 'fluida' ? '<td class="ev">' + esc(flDet(x.fl)) + '</td>' : '') + '</tr>';
+        }).join('') + '</tbody></table>';
+      var evs = '<div class="ev">' + (r.ev || []).map(function (e) { var x = Object.keys(e).filter(function (k) { return k !== 't' && k !== 'k'; }).map(function (k) { return k + '=' + e[k]; }).join(' '); return '<code>' + esc(e.t) + ' s</code>' + esc(e.k) + (x ? ' (' + esc(x) + ')' : ''); }).join(' · ') + '</div>';
+      var envs = '<div class="ev">Entorno: ' + esc(JSON.stringify(r.env || {})) + ' · modelo ' + esc(modelo(r)) + ' · versión ' + esc(r.ver) + ' · retraso de entrada ' + esc(r.delay) + ' tics · totales ' + esc(JSON.stringify(r.total || {})) + (r.fl ? ' · Fluida ' + esc(flDet(r.fl)) : '') + '</div>';
+      det.innerHTML = '<td colspan="16">' + wt + evs + envs + '</td>';
+      tr.onclick = function () { det.hidden = !det.hidden; };
+      tb.appendChild(tr); tb.appendChild(det);
+    });
+  }
+  function load() {
+    msg('Cargando…');
+    token().then(function (t) {
+      return fetch(FS + ':runQuery', { method: 'POST', headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ structuredQuery: { from: [{ collectionId: 'netlogs' }], orderBy: [{ field: { fieldPath: 't' }, direction: 'DESCENDING' }], limit: 200 } }) });
+    }).then(function (r) {
+      if (r.status === 403) throw new Error('Esta página solo funciona con la cuenta del administrador.');
+      if (!r.ok) throw new Error('Error ' + r.status + ' al leer los informes.');
+      return r.json();
+    }).then(function (L) {
+      rows = (L || []).filter(function (x) { return x.document; }).map(function (x) {
+        var f = x.document.fields || {}, rep = {}; try { rep = JSON.parse(f.j && f.j.stringValue || '{}'); } catch (e) { }
+        return { uid: f.uid && f.uid.stringValue, t: f.t && f.t.timestampValue, rep: rep };
+      });
+      $('copy').disabled = !rows.length;
+      msg(rows.length ? rows.length + ' informes (pulsa una fila para ver el detalle)' : 'Aún no hay informes.');
+      render();
+    }).catch(function (e) { msg(e.message || String(e)); });
+  }
+  $('load').onclick = load;
+  $('copy').onclick = function () {
+    var txt = JSON.stringify(rows.map(function (r) { return r.rep; }));
+    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(function () { msg('Copiado (' + Math.round(txt.length / 1024) + ' KB)'); }, function () { msg('No se ha podido copiar'); });
+  };
+  load();
+})();
+</script>
+</body>
+</html>
